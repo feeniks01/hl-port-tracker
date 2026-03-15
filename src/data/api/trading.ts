@@ -336,7 +336,7 @@ export async function submitCopyTrade({
   }
 
   if ("error" in firstStatus) {
-    throw new Error(firstStatus.error);
+    throw new Error(String(firstStatus.error));
   }
 
   if ("filled" in firstStatus) {

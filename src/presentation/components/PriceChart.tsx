@@ -696,7 +696,8 @@ export function PriceChart({
     : primarySymbol;
   const displayCandles = displaySymbol ? candlesBySymbol[displaySymbol] ?? [] : candles;
   const displayAsset =
-    (displaySymbol && assetMap?.[displaySymbol]) ?? (displaySymbol === primarySymbol ? currentAsset : null);
+    (displaySymbol ? assetMap?.[displaySymbol] ?? null : null) ??
+    (displaySymbol === primarySymbol ? currentAsset : null);
   const highlightedCandle = displayCandles[highlightedIndex] ?? null;
   const highlightedTick = chartMode === "ticks" ? liveTicks[highlightedIndex] ?? null : null;
   const highlightedPoint =
