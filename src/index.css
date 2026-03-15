@@ -1,0 +1,133 @@
+@import "../mockup/fontawesome/css/all.min.css";
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family: "Inter", system-ui, sans-serif;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.03), transparent 38%),
+    linear-gradient(180deg, rgba(12, 12, 12, 0.98), #050505 34%, #050505 100%),
+    #050505;
+  color: #f4f4f5;
+  --bg: #050505;
+  --panel: rgba(18, 18, 18, 0.78);
+  --panel-strong: rgba(24, 24, 24, 0.88);
+  --line: rgba(255, 255, 255, 0.08);
+  --gold: #d4a84f;
+  --gold-soft: #f6d48b;
+  --negative: #e06a6a;
+  --muted: #71717a;
+  --muted-soft: #a1a1aa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.03), transparent 38%),
+    linear-gradient(180deg, rgba(12, 12, 12, 0.98), #050505 34%, #050505 100%),
+    #050505;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.display-serif {
+  font-family: "Instrument Serif", Georgia, serif;
+}
+
+.metallic-text {
+  color: var(--gold);
+  background:
+    linear-gradient(105deg, transparent 25%, rgba(255, 255, 255, 0.38) 50%, transparent 75%),
+    linear-gradient(180deg, var(--gold-soft) 0%, var(--gold) 42%, #a8741a 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hairline {
+  border-color: var(--line);
+}
+
+.panel {
+  background: linear-gradient(180deg, rgba(21, 21, 21, 0.84), rgba(10, 10, 10, 0.84));
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(18px);
+}
+
+.hero-glow {
+  position: relative;
+}
+
+.hero-glow::before {
+  content: "";
+  position: absolute;
+  inset: -12% -6%;
+  background: radial-gradient(circle, rgba(212, 168, 79, 0.18), transparent 62%);
+  filter: blur(18px);
+  pointer-events: none;
+  z-index: -1;
+}
+
+.value-tick-up {
+  animation: valueTickUp 420ms ease-out;
+}
+
+.value-tick-down {
+  animation: valueTickDown 420ms ease-out;
+}
+
+@keyframes valueTickUp {
+  0% {
+    transform: translateY(0) scale(1);
+    filter: brightness(1);
+  }
+
+  35% {
+    transform: translateY(-1px) scale(1.012);
+    filter: brightness(1.14);
+  }
+
+  100% {
+    transform: translateY(0) scale(1);
+    filter: brightness(1);
+  }
+}
+
+@keyframes valueTickDown {
+  0% {
+    transform: translateY(0) scale(1);
+    filter: brightness(1);
+  }
+
+  35% {
+    transform: translateY(1px) scale(0.992);
+    filter: brightness(0.92);
+  }
+
+  100% {
+    transform: translateY(0) scale(1);
+    filter: brightness(1);
+  }
+}
+
+.scrollbar-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none;
+}

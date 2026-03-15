@@ -1,0 +1,1048 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import type { AssetRow } from "../../domain/types/market";
+import type { Position } from "../../domain/types/portfolio";
+import type { ChartRangeKey, PriceCandle, PriceEvent } from "../../domain/types/chart";
+import {
+  loadCandleSeries,
+  prefetchCandleSeries,
+  readCachedCandleSeries,
+} from "../hooks/useCandleSeries";
+import { usePriceEvents } from "../hooks/usePriceEvents";
+import { SectionHeading } from "./SectionHeading";
+
+interface PriceChartProps {
+  availableSymbols: string[];
+  selectedSymbols: string[];
+  onSelectedSymbolsChange: (symbols: string[]) => void;
+  currentAsset: AssetRow | null;
+  assetMap?: Record<string, AssetRow>;
+  currentPosition: Position | null;
+  showSymbolPicker?: boolean;
+  sectionTitle?: string;
+  bare?: boolean;
+}
+
+const RANGE_OPTIONS: Array<{ key: ChartRangeKey; label: string }> = [
+  { key: "24h", label: "24H" },
+  { key: "7d", label: "7D" },
+  { key: "30d", label: "30D" },
+];
+
+const currencyFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 2,
+});
+
+const compactFormatter = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 2,
+});
+
+const CHART_WIDTH = 320;
+const CHART_HEIGHT = 152;
+const CHART_PADDING_X = 0;
+const CHART_PADDING_Y = 12;
+const MAX_VISIBLE_LIQUIDATION_DISTANCE_PCT = 250;
+const MAX_SELECTED_SYMBOLS = 3;
+const CHART_COMPARE_COLORS = ["var(--gold)", "rgb(16 185 129)", "rgb(96 165 250)"];
+
+interface ChartGeometry {
+  areaPath: string;
+  linePath: string;
+  maxClose: number;
+  minClose: number;
+  points: Array<{ x: number; y: number }>;
+}
+
+function buildChartGeometry(candles: PriceCandle[], width: number, height: number): ChartGeometry {
+  if (candles.length === 0) {
+    return {
+      linePath: "",
+      areaPath: "",
+      minClose: 0,
+      maxClose: 0,
+      points: [],
+    };
+  }
+
+  const closes = candles.map((candle) => candle.close);
+  const min = Math.min(...closes);
+  const max = Math.max(...closes);
+  const range = max - min || 1;
+  const innerWidth = width - CHART_PADDING_X * 2;
+  const innerHeight = height - CHART_PADDING_Y * 2;
+
+  const points = candles.map((candle, index) => {
+    const x =
+      candles.length === 1
+        ? width / 2
+        : CHART_PADDING_X + (index / (candles.length - 1)) * innerWidth;
+    const y =
+      height -
+      CHART_PADDING_Y -
+      ((candle.close - min) / range) * innerHeight;
+    return { x, y };
+  });
+
+  const linePath = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(" ");
+
+  const baseline = height - CHART_PADDING_Y;
+  const areaPath = `${linePath} L ${points[points.length - 1]?.x.toFixed(2)} ${baseline} L ${
+    points[0]?.x.toFixed(2)
+  } ${baseline} Z`;
+
+  return { linePath, areaPath, minClose: min, maxClose: max, points };
+}
+
+function getChartY(value: number, min: number, max: number, height: number) {
+  const range = max - min || 1;
+  const innerHeight = height - CHART_PADDING_Y * 2;
+
+  return (
+    height -
+    CHART_PADDING_Y -
+    ((value - min) / range) * innerHeight
+  );
+}
+
+function formatTime(timestamp: number) {
+  const date = new Date(timestamp);
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+function formatSignedPercent(value: number, fractionDigits = 2) {
+  const normalized = Math.abs(value) < 10 ** -(fractionDigits + 1) ? 0 : value;
+  return `${normalized >= 0 ? "+" : ""}${normalized.toFixed(fractionDigits)}%`;
+}
+
+function formatTimestamp(timestamp: number) {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(timestamp);
+}
+
+function getDisplayCandleTimestamp(candle: PriceCandle | null, range: ChartRangeKey) {
+  if (!candle) {
+    return "";
+  }
+
+  if (range === "30d") {
+    return formatTimestamp(candle.startTime);
+  }
+
+  return formatTimestamp(candle.endTime + 1);
+}
+
+function getLiquidationDistancePct(markPrice: number | null, liquidationPrice: number | null) {
+  if (!markPrice || !liquidationPrice || markPrice <= 0) {
+    return null;
+  }
+
+  return Math.abs(((markPrice - liquidationPrice) / markPrice) * 100);
+}
+
+interface MultiCandleSeriesState {
+  candlesBySymbol: Record<string, PriceCandle[]>;
+  loading: boolean;
+  error: string | null;
+}
+
+function useMultiCandleSeries(symbols: string[], range: ChartRangeKey) {
+  const symbolsKey = symbols.join("|");
+  const [state, setState] = useState<MultiCandleSeriesState>(() => ({
+    candlesBySymbol: Object.fromEntries(
+      symbols
+        .map((symbol) => [symbol, readCachedCandleSeries(symbol, range) ?? []] as const)
+        .filter(([, candles]) => candles.length > 0),
+    ),
+    loading: symbols.length > 0,
+    error: null,
+  }));
+
+  useEffect(() => {
+    if (symbols.length === 0) {
+      setState({ candlesBySymbol: {}, loading: false, error: null });
+      return;
+    }
+
+    let cancelled = false;
+
+    setState((current) => ({
+      candlesBySymbol: Object.fromEntries(
+        symbols.map((symbol) => [symbol, current.candlesBySymbol[symbol] ?? readCachedCandleSeries(symbol, range) ?? []]),
+      ),
+      loading: true,
+      error: null,
+    }));
+
+    void Promise.all(
+      symbols.map(async (symbol) => [symbol, await loadCandleSeries(symbol, range)] as const),
+    )
+      .then((entries) => {
+        if (cancelled) {
+          return;
+        }
+
+        setState({
+          candlesBySymbol: Object.fromEntries(entries),
+          loading: false,
+          error: null,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+
+        setState((current) => ({
+          candlesBySymbol: current.candlesBySymbol,
+          loading: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to load candle history from Hyperliquid.",
+        }));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [range, symbolsKey, symbols]);
+
+  return state;
+}
+
+function buildCompareChartGeometries(
+  candlesBySymbol: Record<string, PriceCandle[]>,
+  symbols: string[],
+  width: number,
+  height: number,
+) {
+  const normalizedBySymbol = Object.fromEntries(
+    symbols.map((symbol) => {
+      const candles = candlesBySymbol[symbol] ?? [];
+      const base = candles[0]?.open || candles[0]?.close || 0;
+      const values = candles.map((candle) => (base > 0 ? (candle.close / base) * 100 : 100));
+      return [symbol, values] as const;
+    }),
+  );
+
+  const allValues = Object.values(normalizedBySymbol).flat().filter((value) => Number.isFinite(value));
+  const minValue = allValues.length > 0 ? Math.min(...allValues) : 0;
+  const maxValue = allValues.length > 0 ? Math.max(...allValues) : 0;
+  const range = maxValue - minValue || 1;
+  const innerWidth = width - CHART_PADDING_X * 2;
+  const innerHeight = height - CHART_PADDING_Y * 2;
+
+  const geometries = Object.fromEntries(
+    symbols.map((symbol) => {
+      const values = normalizedBySymbol[symbol] ?? [];
+      const points = values.map((value, index) => ({
+        x:
+          values.length === 1
+            ? width / 2
+            : CHART_PADDING_X + (index / (values.length - 1)) * innerWidth,
+        y: height - CHART_PADDING_Y - ((value - minValue) / range) * innerHeight,
+      }));
+
+      const linePath = points
+        .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+        .join(" ");
+
+      return [symbol, { linePath, points }] as const;
+    }),
+  );
+
+  return { geometries, minValue, maxValue };
+}
+
+function markerFill(sentiment: PriceEvent["sentiment"], active: boolean) {
+  if (active) {
+    return "var(--gold)";
+  }
+
+  if (sentiment === "positive") {
+    return "rgb(16 185 129)";
+  }
+
+  if (sentiment === "negative") {
+    return "rgb(244 63 94)";
+  }
+
+  return "rgba(255,255,255,0.9)";
+}
+
+export function PriceChart({
+  availableSymbols,
+  selectedSymbols,
+  onSelectedSymbolsChange,
+  currentAsset,
+  assetMap,
+  currentPosition,
+  showSymbolPicker = true,
+  sectionTitle = "Price History",
+  bare = false,
+}: PriceChartProps) {
+  const [range, setRange] = useState<ChartRangeKey>("24h");
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [pinnedIndex, setPinnedIndex] = useState<number | null>(null);
+  const [focusedCompareSymbol, setFocusedCompareSymbol] = useState<string | null>(null);
+  const [activeEventId, setActiveEventId] = useState<string | null>(null);
+  const chartRef = useRef<SVGSVGElement | null>(null);
+  const chartWrapRef = useRef<HTMLDivElement | null>(null);
+  const [chartWidth, setChartWidth] = useState(CHART_WIDTH);
+  const primarySymbol = selectedSymbols[0] ?? null;
+  const compareMode = selectedSymbols.length > 1;
+  const { candlesBySymbol, loading, error } = useMultiCandleSeries(selectedSymbols, range);
+  const candles = primarySymbol ? candlesBySymbol[primarySymbol] ?? [] : [];
+  const { events } = usePriceEvents(selectedSymbols, range);
+
+  useEffect(() => {
+    const element = chartWrapRef.current;
+
+    if (!element) {
+      return;
+    }
+
+    const updateWidth = () => {
+      setChartWidth(Math.max(Math.round(element.clientWidth), CHART_WIDTH));
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateWidth);
+
+      return () => {
+        window.removeEventListener("resize", updateWidth);
+      };
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateWidth();
+    });
+
+    observer.observe(element);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    setActiveEventId(null);
+    setFocusedCompareSymbol(null);
+  }, [range, primarySymbol, selectedSymbols]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const primaryPrefetchSymbol = selectedSymbols[0];
+
+      if (primaryPrefetchSymbol) {
+        RANGE_OPTIONS.filter((option) => option.key !== range).forEach((option) => {
+          prefetchCandleSeries(primaryPrefetchSymbol, option.key);
+        });
+      }
+
+      selectedSymbols.slice(1, 3).forEach((symbol) => {
+        prefetchCandleSeries(symbol, range);
+      });
+    }, 120);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [range, selectedSymbols]);
+
+  const currentPrice = candles[candles.length - 1]?.close ?? currentAsset?.price ?? null;
+  const firstPrice = candles[0]?.open ?? null;
+  const percentChange =
+    currentPrice !== null && firstPrice !== null && firstPrice !== 0
+      ? ((currentPrice - firstPrice) / firstPrice) * 100
+      : currentAsset?.change24hPct ?? null;
+  const totalVolume = candles.reduce((sum, candle) => sum + candle.volume, 0);
+  const chartGeometry = useMemo(
+    () => buildChartGeometry(candles, chartWidth, CHART_HEIGHT),
+    [candles, chartWidth],
+  );
+  const compareGeometries = useMemo(
+    () => buildCompareChartGeometries(candlesBySymbol, selectedSymbols, chartWidth, CHART_HEIGHT),
+    [candlesBySymbol, chartWidth, selectedSymbols],
+  );
+  const eventMarkers = useMemo(() => {
+    if (candles.length === 0 || events.length === 0 || chartGeometry.points.length === 0) {
+      return [] as Array<{
+        event: PriceEvent;
+        x: number;
+        y: number;
+        nearestIndex: number;
+        stackLevel: number;
+      }>;
+    }
+
+    const startTime = candles[0].startTime;
+    const endTime = candles[candles.length - 1].endTime;
+    const timeSpan = Math.max(endTime - startTime, 1);
+
+    const positioned = events
+      .map((event) => {
+        const normalized = (event.timestamp - startTime) / timeSpan;
+        const x = Math.min(Math.max(normalized, 0), 1) * chartWidth;
+        const nearestIndex = candles.reduce((closestIndex, candle, index) => {
+          const currentDistance = Math.abs(candle.endTime - event.timestamp);
+          const closestDistance = Math.abs(candles[closestIndex].endTime - event.timestamp);
+          return currentDistance < closestDistance ? index : closestIndex;
+        }, 0);
+
+        return {
+          event,
+          x,
+          y: Math.max(CHART_HEIGHT - 18, 18),
+          nearestIndex,
+        };
+      })
+      .sort((left, right) => left.x - right.x);
+
+    return positioned.map((marker, index) => {
+      const previous = index > 0 ? positioned[index - 1] : null;
+      const previousStackLevel =
+        index > 0 && Math.abs((previous?.x ?? 0) - marker.x) < 18
+          ? (positioned[index - 1] as typeof marker & { stackLevel?: number }).stackLevel ?? 0
+          : -1;
+      const stackLevel = previousStackLevel + 1;
+
+      (positioned[index] as typeof marker & { stackLevel?: number }).stackLevel = stackLevel;
+
+      return {
+        ...marker,
+        stackLevel,
+        y: Math.max(marker.y - stackLevel * 12, 18),
+      };
+    });
+  }, [candles, chartGeometry.points, chartWidth, events]);
+  const activeEvent =
+    eventMarkers.find((marker) => marker.event.id === activeEventId) ?? null;
+  const isInspectingCandle = activeIndex !== null || pinnedIndex !== null;
+  const highlightedIndex = activeIndex ?? pinnedIndex ?? candles.length - 1;
+  const displaySymbol = compareMode
+    ? focusedCompareSymbol ?? primarySymbol
+    : primarySymbol;
+  const displayCandles = displaySymbol ? candlesBySymbol[displaySymbol] ?? [] : candles;
+  const displayAsset =
+    (displaySymbol && assetMap?.[displaySymbol]) ?? (displaySymbol === primarySymbol ? currentAsset : null);
+  const highlightedCandle = displayCandles[highlightedIndex] ?? null;
+  const highlightedPoint = compareMode
+    ? compareGeometries.geometries[displaySymbol ?? ""]?.points[highlightedIndex] ?? null
+    : chartGeometry.points[highlightedIndex] ?? null;
+  const displayPrice =
+    isInspectingCandle && highlightedCandle
+      ? highlightedCandle.close
+      : currentPrice;
+  const priceLabel =
+    showSymbolPicker || !bare
+      ? `${displaySymbol ?? primarySymbol ?? "Selection"} Price`
+      : displaySymbol ?? primarySymbol ?? "Selection";
+  const displayTimestamp = getDisplayCandleTimestamp(highlightedCandle, range);
+  const displayVolume =
+    isInspectingCandle && highlightedCandle
+      ? `${compactFormatter.format(highlightedCandle.volume)} vol`
+      : " ";
+  const compareReadouts = useMemo(
+    () =>
+      selectedSymbols.map((symbol) => {
+        const symbolCandles = candlesBySymbol[symbol] ?? [];
+        const symbolAsset = assetMap?.[symbol] ?? null;
+        const currentSymbolPrice =
+          symbolCandles[symbolCandles.length - 1]?.close ?? symbolAsset?.price ?? null;
+        const basePrice = symbolCandles[0]?.open ?? null;
+        const highlightedSymbolCandle = symbolCandles[highlightedIndex] ?? null;
+        const displaySymbolPrice =
+          isInspectingCandle && highlightedSymbolCandle
+            ? highlightedSymbolCandle.close
+            : currentSymbolPrice;
+        const displaySymbolChange =
+          displaySymbolPrice !== null && basePrice !== null && basePrice !== 0
+            ? ((displaySymbolPrice - basePrice) / basePrice) * 100
+            : symbolAsset?.change24hPct ?? null;
+
+        return {
+          symbol,
+          price: displaySymbolPrice,
+          changePct: displaySymbolChange,
+        };
+      }),
+    [assetMap, candlesBySymbol, highlightedIndex, isInspectingCandle, selectedSymbols],
+  );
+  const liquidationPrice = currentPosition?.liquidationPrice ?? null;
+  const liquidationDistancePct = getLiquidationDistancePct(
+    currentPrice ?? currentPosition?.markPrice ?? null,
+    liquidationPrice,
+  );
+  const liquidationInVisibleRange =
+    liquidationPrice !== null &&
+    candles.length > 0 &&
+    liquidationPrice >= chartGeometry.minClose &&
+    liquidationPrice <= chartGeometry.maxClose;
+  const shouldShowLiquidationGuide =
+    !compareMode &&
+    liquidationPrice !== null &&
+    liquidationDistancePct !== null &&
+    liquidationDistancePct <= MAX_VISIBLE_LIQUIDATION_DISTANCE_PCT &&
+    liquidationInVisibleRange;
+  const liquidationLine = useMemo(() => {
+    if (!shouldShowLiquidationGuide || !liquidationPrice || candles.length === 0) {
+      return null;
+    }
+
+    const unclampedY = getChartY(
+      liquidationPrice,
+      chartGeometry.minClose,
+      chartGeometry.maxClose,
+      CHART_HEIGHT,
+    );
+    const y = Math.min(Math.max(unclampedY, CHART_PADDING_Y + 8), CHART_HEIGHT - CHART_PADDING_Y);
+
+    return {
+      y,
+      label: `Liq ${currencyFormatter.format(liquidationPrice)}`,
+    };
+  }, [
+    candles.length,
+    chartGeometry.maxClose,
+    chartGeometry.minClose,
+    liquidationPrice,
+    shouldShowLiquidationGuide,
+  ]);
+
+  const updateActiveIndex = (clientX: number, clientY: number) => {
+    const bounds = chartRef.current?.getBoundingClientRect();
+
+    if (!bounds || candles.length === 0) {
+      return null;
+    }
+
+    const relativeX = Math.min(Math.max(clientX - bounds.left, 0), bounds.width);
+    const normalizedX = relativeX / bounds.width;
+    const nextIndex = Math.round(normalizedX * (candles.length - 1));
+    const clampedIndex = Math.min(Math.max(nextIndex, 0), candles.length - 1);
+    if (compareMode) {
+      const relativeY = Math.min(Math.max(clientY - bounds.top, 0), bounds.height);
+      const closestSymbol = selectedSymbols.reduce<{ symbol: string | null; distance: number }>(
+        (closest, symbol) => {
+          const point = compareGeometries.geometries[symbol]?.points[clampedIndex];
+
+          if (!point) {
+            return closest;
+          }
+
+          const distance = Math.abs(point.y - relativeY);
+          return distance < closest.distance ? { symbol, distance } : closest;
+        },
+        { symbol: focusedCompareSymbol ?? primarySymbol, distance: Number.POSITIVE_INFINITY },
+      ).symbol;
+
+      if (closestSymbol) {
+        setFocusedCompareSymbol(closestSymbol);
+      }
+    }
+
+    setActiveIndex(clampedIndex);
+    return clampedIndex;
+  };
+
+  const tooltipX = highlightedPoint
+    ? Math.min(Math.max(highlightedPoint.x - 42, 8), chartWidth - 92)
+    : 8;
+  const tooltipY = highlightedPoint
+    ? Math.max(highlightedPoint.y - 34, 8)
+    : 8;
+
+  return (
+    <section className="mb-8">
+      {sectionTitle ? <SectionHeading title={sectionTitle} /> : null}
+      <div className={bare ? "px-0 py-0" : "panel rounded-[28px] p-5"}>
+              {showSymbolPicker ? (
+          <div className="mb-5 flex flex-wrap gap-2">
+              {availableSymbols.map((symbol) => {
+                const activeIndex = selectedSymbols.indexOf(symbol);
+              const active = activeIndex !== -1;
+              const disabled = !active && selectedSymbols.length >= MAX_SELECTED_SYMBOLS;
+
+              return (
+                <button
+                  key={symbol}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => {
+                    if (active) {
+                      if (selectedSymbols.length === 1) {
+                        return;
+                      }
+
+                      onSelectedSymbolsChange(selectedSymbols.filter((selected) => selected !== symbol));
+                      return;
+                    }
+
+                    if (selectedSymbols.length >= MAX_SELECTED_SYMBOLS) {
+                      return;
+                    }
+
+                    onSelectedSymbolsChange([symbol, ...selectedSymbols]);
+                  }}
+                  className={`rounded-full px-3 py-2 text-xs font-medium uppercase tracking-[0.16em] transition ${
+                    active
+                      ? "text-zinc-950"
+                      : disabled
+                        ? "cursor-not-allowed bg-white/[0.03] text-zinc-600"
+                        : "bg-white/4 text-zinc-400 hover:bg-white/7"
+                  }`}
+                  style={
+                    active
+                      ? {
+                          backgroundColor: CHART_COMPARE_COLORS[activeIndex] ?? "var(--gold)",
+                        }
+                      : undefined
+                  }
+                >
+                  <span className="flex items-center gap-2">
+                    {active ? (
+                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-black/65" />
+                    ) : null}
+                    <span>{symbol}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+
+        <div className="mb-3 flex items-end justify-between gap-4">
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-[0.18em] text-zinc-500">
+              {priceLabel}
+            </div>
+            <div className="display-serif text-[2.6rem] leading-none tracking-[-0.04em] text-zinc-100">
+              {displayPrice !== null ? currencyFormatter.format(displayPrice) : "—"}
+            </div>
+          </div>
+          {compareMode ? null : (
+            <div
+              className={`rounded-full px-3 py-2 text-sm font-medium ${
+                (percentChange ?? 0) >= 0 ? "bg-emerald-500/12 text-emerald-200" : "bg-rose-500/12 text-rose-200"
+              }`}
+            >
+              {percentChange !== null ? formatSignedPercent(percentChange) : "—"}
+            </div>
+          )}
+        </div>
+
+        {compareMode ? (
+          <div className="mb-5 flex flex-wrap gap-2">
+            {compareReadouts.map((readout, index) => {
+              const active = readout.symbol === displaySymbol;
+
+              return (
+                <div
+                  key={readout.symbol}
+                  className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-right ${
+                    active ? "bg-white/[0.06]" : "bg-transparent"
+                  }`}
+                >
+                  <span
+                    className="inline-block h-2 w-2 rounded-full"
+                    style={{ backgroundColor: CHART_COMPARE_COLORS[index] ?? "var(--gold)" }}
+                  />
+                  <span className="text-[0.68rem] font-medium uppercase tracking-[0.14em] text-zinc-500">
+                    {readout.symbol}
+                  </span>
+                  <span className="text-sm font-medium text-zinc-100">
+                    {readout.price !== null ? currencyFormatter.format(readout.price) : "—"}
+                  </span>
+                  <span
+                    className={`text-xs font-semibold ${
+                      (readout.changePct ?? 0) >= 0 ? "text-emerald-200" : "text-[var(--negative)]"
+                    }`}
+                  >
+                    {readout.changePct !== null ? formatSignedPercent(readout.changePct) : "—"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        <div className="mb-5 flex gap-2">
+          {RANGE_OPTIONS.map((option) => {
+            const active = option.key === range;
+
+            return (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => setRange(option.key)}
+                className={`rounded-full px-3 py-2 text-xs font-medium uppercase tracking-[0.16em] transition ${
+                  active
+                    ? "bg-white/10 text-zinc-100"
+                    : "bg-transparent text-zinc-500 hover:bg-white/6"
+                }`}
+              >
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div
+          ref={chartWrapRef}
+          className="relative rounded-[24px] border border-white/6 bg-white/[0.03] p-4"
+        >
+          {loading && candles.length === 0 ? (
+            <div
+              className="animate-pulse rounded-[18px] bg-white/6"
+              style={{ height: `${CHART_HEIGHT}px` }}
+            />
+          ) : error && candles.length === 0 ? (
+            <div className="rounded-[18px] border border-rose-500/20 bg-rose-500/10 px-4 py-4 text-sm text-rose-200">
+              {error}
+            </div>
+          ) : candles.length === 0 ? (
+            <div
+              className="rounded-[18px] bg-white/4 px-4 py-4 text-sm text-zinc-400"
+              style={{ height: `${CHART_HEIGHT}px` }}
+            >
+              No candle data returned for this selection.
+            </div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center justify-between gap-3 text-xs text-zinc-500">
+                <span>{displayTimestamp}</span>
+                <span>{displayVolume}</span>
+              </div>
+              <svg
+                ref={chartRef}
+                viewBox={`0 0 ${chartWidth} ${CHART_HEIGHT}`}
+                className="w-full overflow-visible touch-none"
+                style={{ height: `${CHART_HEIGHT}px` }}
+                onPointerDown={(event) => {
+                  const nextIndex = updateActiveIndex(event.clientX, event.clientY);
+                  setPinnedIndex(nextIndex);
+                }}
+                onPointerMove={(event) => {
+                  if (event.pointerType === "mouse" || event.pressure > 0) {
+                    updateActiveIndex(event.clientX, event.clientY);
+                  }
+                }}
+                onPointerLeave={() => {
+                  setActiveIndex(null);
+                  if (pinnedIndex === null) {
+                    setFocusedCompareSymbol(null);
+                  }
+                }}
+              >
+                <defs>
+                  <linearGradient id="price-chart-fill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stopColor="rgba(212,168,79,0.45)" />
+                    <stop offset="100%" stopColor="rgba(212,168,79,0)" />
+                  </linearGradient>
+                </defs>
+                {!compareMode ? <path d={chartGeometry.areaPath} fill="url(#price-chart-fill)" /> : null}
+                {compareMode
+                  ? selectedSymbols.map((symbol, index) => {
+                      const geometry = compareGeometries.geometries[symbol];
+
+                      if (!geometry?.linePath) {
+                        return null;
+                      }
+
+                      return (
+                        <path
+                          key={symbol}
+                          d={geometry.linePath}
+                          fill="none"
+                          stroke={CHART_COMPARE_COLORS[index] ?? "var(--gold)"}
+                          strokeWidth={symbol === primarySymbol ? "3" : "2.2"}
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          opacity={symbol === primarySymbol ? 1 : 0.95}
+                        />
+                      );
+                    })
+                  : (
+                    <path
+                      d={chartGeometry.linePath}
+                      fill="none"
+                      stroke="var(--gold)"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    )}
+                {liquidationLine ? (
+                  <>
+                    <line
+                      x1={0}
+                      x2={chartWidth}
+                      y1={liquidationLine.y}
+                      y2={liquidationLine.y}
+                      stroke="rgba(244,63,94,0.58)"
+                      strokeWidth="1.5"
+                      strokeDasharray="6 5"
+                    />
+                    <g transform={`translate(8, ${Math.max(liquidationLine.y - 11, 4)})`}>
+                      <rect
+                        x="0"
+                        y="0"
+                        width="120"
+                        height="18"
+                        rx="9"
+                        fill="rgba(35,8,14,0.92)"
+                        stroke="rgba(244,63,94,0.18)"
+                      />
+                      <text
+                        x="60"
+                        y="12"
+                        textAnchor="middle"
+                        fill="rgb(254 205 211)"
+                        fontSize="9"
+                        fontWeight="600"
+                        letterSpacing="0.04em"
+                      >
+                        {liquidationLine.label}
+                      </text>
+                    </g>
+                  </>
+                ) : null}
+                {highlightedPoint ? (
+                  <>
+                    <line
+                      x1={CHART_PADDING_X}
+                      x2={chartWidth - CHART_PADDING_X}
+                      y1={highlightedPoint.y}
+                      y2={highlightedPoint.y}
+                      stroke="rgba(255,255,255,0.12)"
+                      strokeWidth="1"
+                      strokeDasharray="4 4"
+                    />
+                    <line
+                      x1={highlightedPoint.x}
+                      x2={highlightedPoint.x}
+                      y1={CHART_PADDING_Y}
+                      y2={CHART_HEIGHT - CHART_PADDING_Y}
+                      stroke="rgba(255,255,255,0.22)"
+                      strokeWidth="1"
+                      strokeDasharray="4 4"
+                    />
+                    {compareMode
+                      ? selectedSymbols.map((symbol, index) => {
+                          const point =
+                            compareGeometries.geometries[symbol]?.points[highlightedIndex] ?? null;
+
+                          if (!point) {
+                            return null;
+                          }
+
+                          return (
+                            <circle
+                              key={symbol}
+                              cx={point.x}
+                              cy={point.y}
+                              r={symbol === primarySymbol ? "4" : "3.5"}
+                              fill={CHART_COMPARE_COLORS[index] ?? "var(--gold)"}
+                              stroke="rgba(5,5,5,0.9)"
+                              strokeWidth="2"
+                            />
+                          );
+                        })
+                      : (
+                        <circle
+                          cx={highlightedPoint.x}
+                          cy={highlightedPoint.y}
+                          r="4"
+                          fill="var(--gold)"
+                          stroke="rgba(5,5,5,0.9)"
+                          strokeWidth="2"
+                        />
+                        )}
+                    <g transform={`translate(${tooltipX}, ${tooltipY})`}>
+                      <rect
+                        x="0"
+                        y="0"
+                        width="84"
+                        height="24"
+                        rx="12"
+                        fill="rgba(15,15,15,0.92)"
+                        stroke="rgba(255,255,255,0.08)"
+                      />
+                      <text
+                        x="42"
+                        y="16"
+                        textAnchor="middle"
+                        fill="var(--gold)"
+                        fontSize="10"
+                        fontWeight="600"
+                        letterSpacing="0.04em"
+                      >
+                        {currencyFormatter.format(highlightedCandle?.close ?? 0)}
+                      </text>
+                    </g>
+                  </>
+                ) : null}
+                {eventMarkers.map((marker) => {
+                  const isActive = marker.event.id === activeEventId;
+
+                  return (
+                    <g key={marker.event.id}>
+                      <line
+                        x1={marker.x}
+                        x2={marker.x}
+                        y1={marker.y + 6}
+                        y2={CHART_HEIGHT - CHART_PADDING_Y}
+                        stroke={isActive ? "rgba(212,168,79,0.35)" : "rgba(255,255,255,0.12)"}
+                        strokeWidth="1"
+                        strokeDasharray="3 4"
+                      />
+                      <circle
+                        cx={marker.x}
+                        cy={marker.y}
+                        r={isActive ? "6" : "5"}
+                        fill={markerFill(marker.event.sentiment, isActive)}
+                        stroke="rgba(5,5,5,0.95)"
+                        strokeWidth="2"
+                        onPointerDown={(event) => {
+                          event.stopPropagation();
+                          setActiveEventId((current) =>
+                            current === marker.event.id ? null : marker.event.id,
+                          );
+                          setPinnedIndex(marker.nearestIndex);
+                          setFocusedCompareSymbol(primarySymbol);
+                        }}
+                        onPointerEnter={() => {
+                          setActiveEventId(marker.event.id);
+                          setPinnedIndex(marker.nearestIndex);
+                          setFocusedCompareSymbol(primarySymbol);
+                        }}
+                        style={{ cursor: "pointer" }}
+                      />
+                      <path
+                        stroke="rgba(5,5,5,0.92)"
+                        strokeWidth="1.4"
+                        strokeLinecap="round"
+                        d={`M ${marker.x} ${marker.y - 2.7} L ${marker.x} ${marker.y + 0.8}`}
+                        pointerEvents="none"
+                      />
+                      <circle
+                        cx={marker.x}
+                        cy={marker.y + 2.5}
+                        r="0.8"
+                        fill="rgba(5,5,5,0.92)"
+                        pointerEvents="none"
+                      />
+                    </g>
+                  );
+                })}
+                <rect
+                  x={0}
+                  y={0}
+                  width={chartWidth}
+                  height={CHART_HEIGHT}
+                  fill="transparent"
+                  pointerEvents="none"
+                />
+              </svg>
+              <svg
+                viewBox={`0 0 ${chartWidth} 18`}
+                className="mt-3 h-[18px] w-full overflow-visible"
+              >
+                <text
+                  x={
+                    (compareMode
+                      ? compareGeometries.geometries[primarySymbol ?? ""]?.points[0]?.x
+                      : chartGeometry.points[0]?.x) ?? CHART_PADDING_X
+                  }
+                  y="13"
+                  textAnchor="middle"
+                  fill="rgb(113 113 122)"
+                  fontSize="10"
+                  letterSpacing="0.08em"
+                >
+                  {formatTime(candles[0].startTime)}
+                </text>
+                <text
+                  x={
+                    (compareMode
+                      ? compareGeometries.geometries[primarySymbol ?? ""]?.points[
+                          (compareGeometries.geometries[primarySymbol ?? ""]?.points.length ?? 1) - 1
+                        ]?.x
+                      : chartGeometry.points[chartGeometry.points.length - 1]?.x) ??
+                    chartWidth - CHART_PADDING_X
+                  }
+                  y="13"
+                  textAnchor="middle"
+                  fill="rgb(113 113 122)"
+                  fontSize="10"
+                  letterSpacing="0.08em"
+                >
+                  {formatTime(candles[candles.length - 1].endTime)}
+                </text>
+              </svg>
+              {activeEvent ? (
+                <div className="mt-3 rounded-[18px] border border-white/6 bg-black/20 px-4 py-3">
+                  <div className="text-sm font-medium text-zinc-100">
+                    {activeEvent.event.title}
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3 text-xs text-zinc-500">
+                    <span>
+                      {activeEvent.event.asset ? `${activeEvent.event.asset} · ` : ""}
+                      {activeEvent.event.source}
+                    </span>
+                    <span>{formatTimestamp(activeEvent.event.timestamp)}</span>
+                  </div>
+                  {activeEvent.event.url ? (
+                    <a
+                      href={activeEvent.event.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-3 inline-flex items-center gap-2 text-xs font-medium uppercase tracking-[0.14em] text-zinc-300 transition hover:text-zinc-100"
+                    >
+                      Read source
+                      <span aria-hidden>↗</span>
+                    </a>
+                  ) : null}
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-3 text-sm text-zinc-400">
+          <div className="rounded-[18px] bg-white/[0.03] px-4 py-3">
+            <div className="mb-1 text-xs uppercase tracking-[0.16em] text-zinc-500">24h Change</div>
+            <div className="font-medium text-zinc-100">
+              {displayAsset ? formatSignedPercent(displayAsset.change24hPct) : "—"}
+            </div>
+          </div>
+          <div className="rounded-[18px] bg-white/[0.03] px-4 py-3">
+            <div className="mb-1 text-xs uppercase tracking-[0.16em] text-zinc-500">
+              {shouldShowLiquidationGuide ? "Liq Distance" : "Range Volume"}
+            </div>
+            <div className="font-medium text-zinc-100">
+              {shouldShowLiquidationGuide
+                ? `${liquidationDistancePct?.toFixed(2) ?? "—"}%`
+                : candles.length
+                  ? compactFormatter.format(totalVolume)
+                  : "—"}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
