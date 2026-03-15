@@ -73,7 +73,7 @@ export function PositionsList({
           {[0, 1].map((index) => (
             <div
               key={index}
-              className="panel rounded-[28px] p-5"
+              className="panel rounded-[28px] px-5 py-4"
             >
               <div className="mb-4 h-4 w-24 animate-pulse rounded bg-white/8" />
               <div className="mb-3 h-3 w-32 animate-pulse rounded bg-white/6" />
@@ -95,7 +95,12 @@ export function PositionsList({
             const isLong = position.size >= 0;
 
             return (
-              <article key={positionKey} className="panel rounded-[28px] p-5">
+              <button
+                key={positionKey}
+                type="button"
+                onClick={() => onAssetSelect(position.coin)}
+                className="panel w-full rounded-[28px] px-5 py-4 text-left transition hover:bg-white/[0.035]"
+              >
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 text-base font-semibold text-zinc-100">
@@ -122,35 +127,16 @@ export function PositionsList({
                     <div className="mt-1">
                       <AnimatedPnlValue value={position.unrealizedPnl} />
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => onAssetSelect(position.coin)}
-                      aria-label={`Open ${position.coin} full breakdown`}
-                      className="mt-4 rounded-full border border-white/8 p-2.5 text-zinc-300 transition hover:bg-white/5 hover:text-zinc-100"
-                    >
-                      <svg
-                        className="h-3.5 w-3.5"
-                        viewBox="0 0 16 16"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M8 3v10" />
-                        <path d="M3 8h10" />
-                      </svg>
-                    </button>
                   </div>
                 </div>
-              </article>
+              </button>
             );
           })}
           {positions.length > MAX_VISIBLE_POSITIONS ? (
             <button
               type="button"
               onClick={() => setShowAllPositions((current) => !current)}
-              className="w-full rounded-[20px] border border-white/8 px-4 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.03]"
+              className="w-full px-1 py-2 text-center text-sm font-medium text-zinc-300 transition hover:text-zinc-100"
             >
               {showAllPositions
                 ? "Show fewer positions"

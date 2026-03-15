@@ -5,6 +5,7 @@ import { createStore } from "./createStore";
 
 interface PortfolioState {
   address: string;
+  recentAddresses: string[];
   summary: AccountSummary | null;
   positions: Position[];
   loading: boolean;
@@ -17,6 +18,8 @@ interface PortfolioState {
 }
 
 const STORAGE_KEY = "hyperliquid:last-address";
+const RECENT_STORAGE_KEY = "hyperliquid:recent-addresses";
+const MAX_RECENT_ADDRESSES = 6;
 let latestPortfolioRequestId = 0;
 
 function isValidAddress(address: string) {
@@ -27,8 +30,41 @@ function toNumber(value: string | undefined) {
   return value ? Number(value) : 0;
 }
 
+function readRecentAddresses() {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  try {
+    const stored = window.localStorage.getItem(RECENT_STORAGE_KEY);
+
+    if (!stored) {
+      return [];
+    }
+
+    const parsed = JSON.parse(stored);
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string" && isValidAddress(value))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecentAddresses(address: string) {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  const nextAddresses = [address, ...readRecentAddresses().filter((value) => value !== address)]
+    .slice(0, MAX_RECENT_ADDRESSES);
+  window.localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(nextAddresses));
+  return nextAddresses;
+}
+
 export const usePortfolioStore = createStore<PortfolioState>((set) => ({
   address: "",
+  recentAddresses: [],
   summary: null,
   positions: [],
   loading: false,
@@ -40,9 +76,11 @@ export const usePortfolioStore = createStore<PortfolioState>((set) => ({
     }
 
     const storedAddress = window.localStorage.getItem(STORAGE_KEY)?.trim() ?? "";
+    const recentAddresses = readRecentAddresses();
 
     set({
       address: storedAddress,
+      recentAddresses,
       hydrated: true,
     });
   },
@@ -78,7 +116,9 @@ export const usePortfolioStore = createStore<PortfolioState>((set) => ({
       window.localStorage.setItem(STORAGE_KEY, trimmed);
     }
 
-    set({ address: trimmed, loading: true, error: null });
+    const recentAddresses = writeRecentAddresses(trimmed);
+
+    set({ address: trimmed, recentAddresses, loading: true, error: null });
 
     try {
       const state = await fetchClearinghouseState(trimmed);
@@ -112,6 +152,7 @@ export const usePortfolioStore = createStore<PortfolioState>((set) => ({
 
       set({
         address: trimmed,
+        recentAddresses,
         summary: {
           netEquity,
           withdrawable,

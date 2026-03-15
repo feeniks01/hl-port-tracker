@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import type { AssetRow } from "../../domain/types/market";
+import type { AssetRow, TickPoint } from "../../domain/types/market";
 import type { Position } from "../../domain/types/portfolio";
 import type { ChartRangeKey, PriceCandle, PriceEvent } from "../../domain/types/chart";
 import {
   loadCandleSeries,
+  loadCandleSeriesByInterval,
   prefetchCandleSeries,
   readCachedCandleSeries,
 } from "../hooks/useCandleSeries";
 import { usePriceEvents } from "../hooks/usePriceEvents";
+import { useMarketStore } from "../stores/marketStore";
 import { SectionHeading } from "./SectionHeading";
 
 interface PriceChartProps {
@@ -21,6 +23,8 @@ interface PriceChartProps {
   showSymbolPicker?: boolean;
   sectionTitle?: string;
   bare?: boolean;
+  hidePriceLabel?: boolean;
+  allowTickMode?: boolean;
 }
 
 const RANGE_OPTIONS: Array<{ key: ChartRangeKey; label: string }> = [
@@ -29,30 +33,101 @@ const RANGE_OPTIONS: Array<{ key: ChartRangeKey; label: string }> = [
   { key: "30d", label: "30D" },
 ];
 
+const LIVE_RANGE_OPTIONS = [
+  { key: "1m", label: "1m", windowMs: 1 * 60 * 1000 },
+  { key: "5m", label: "5m", windowMs: 5 * 60 * 1000 },
+  { key: "15m", label: "15m", windowMs: 15 * 60 * 1000 },
+  { key: "1h", label: "1h", windowMs: 60 * 60 * 1000 },
+  { key: "4h", label: "4h", windowMs: 4 * 60 * 60 * 1000 },
+] as const;
+
 const currencyFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
   maximumFractionDigits: 2,
 });
 
-const compactFormatter = new Intl.NumberFormat("en-US", {
+const compactUsdFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
   notation: "compact",
   maximumFractionDigits: 2,
 });
 
-const CHART_WIDTH = 320;
-const CHART_HEIGHT = 152;
+const CHART_HEIGHT = 190;
 const CHART_PADDING_X = 0;
 const CHART_PADDING_Y = 12;
 const MAX_VISIBLE_LIQUIDATION_DISTANCE_PCT = 250;
 const MAX_SELECTED_SYMBOLS = 3;
+const MAX_VISIBLE_SYMBOL_CHIPS = 5;
 const CHART_COMPARE_COLORS = ["var(--gold)", "rgb(16 185 129)", "rgb(96 165 250)"];
+const LIVE_PREFILL_LOOKBACK_MS = 4 * 60 * 60 * 1000;
+
+function formatDisplayPrice(price: number) {
+  if (price >= 1000) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    }).format(price);
+  }
+
+  if (price >= 1) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(price);
+  }
+
+  if (price >= 0.01) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 3,
+      maximumFractionDigits: 4,
+    }).format(price);
+  }
+
+  if (price > 0) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 4,
+      maximumFractionDigits: 6,
+    }).format(price);
+  }
+
+  return "$0.00";
+}
+
+function formatDisplayVolume(volume: number) {
+  if (volume >= 1000) {
+    return compactUsdFormatter.format(volume);
+  }
+
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(volume);
+}
 
 interface ChartGeometry {
   areaPath: string;
   linePath: string;
   maxClose: number;
   minClose: number;
+  points: Array<{ x: number; y: number }>;
+}
+
+interface TickGeometry {
+  linePath: string;
+  maxPrice: number;
+  minPrice: number;
   points: Array<{ x: number; y: number }>;
 }
 
@@ -98,6 +173,68 @@ function buildChartGeometry(candles: PriceCandle[], width: number, height: numbe
   return { linePath, areaPath, minClose: min, maxClose: max, points };
 }
 
+function buildTickGeometry(
+  ticks: TickPoint[],
+  width: number,
+  height: number,
+  windowStart: number,
+  windowEnd: number,
+): TickGeometry {
+  if (ticks.length === 0) {
+    return {
+      linePath: "",
+      minPrice: 0,
+      maxPrice: 0,
+      points: [],
+    };
+  }
+
+  const prices = ticks.map((tick) => tick.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const innerWidth = width - CHART_PADDING_X * 2;
+  const innerHeight = height - CHART_PADDING_Y * 2;
+  const timeSpan = Math.max(windowEnd - windowStart, 1);
+
+  const points = ticks.map((tick) => {
+    const normalized = Math.min(Math.max((tick.timestamp - windowStart) / timeSpan, 0), 1);
+    const x = CHART_PADDING_X + normalized * innerWidth;
+    const y =
+      height -
+      CHART_PADDING_Y -
+      ((tick.price - min) / range) * innerHeight;
+    return { x, y };
+  });
+
+  if (points.length === 1) {
+    const point = points[0];
+    const startX = Math.max(point.x - 18, CHART_PADDING_X);
+    const endX = Math.min(point.x + 18, width - CHART_PADDING_X);
+
+    return {
+      linePath: `M ${startX.toFixed(2)} ${point.y.toFixed(2)} L ${endX.toFixed(2)} ${point.y.toFixed(2)}`,
+      minPrice: min,
+      maxPrice: max,
+      points,
+    };
+  }
+
+  const firstPoint = points[0];
+  const pathSegments = [`M ${firstPoint.x.toFixed(2)} ${firstPoint.y.toFixed(2)}`];
+
+  for (let index = 1; index < points.length; index += 1) {
+    const previousPoint = points[index - 1];
+    const point = points[index];
+    pathSegments.push(`L ${point.x.toFixed(2)} ${previousPoint.y.toFixed(2)}`);
+    pathSegments.push(`L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`);
+  }
+
+  const linePath = pathSegments.join(" ");
+
+  return { linePath, minPrice: min, maxPrice: max, points };
+}
+
 function getChartY(value: number, min: number, max: number, height: number) {
   const range = max - min || 1;
   const innerHeight = height - CHART_PADDING_Y * 2;
@@ -127,6 +264,28 @@ function formatTimestamp(timestamp: number) {
     minute: "2-digit",
     hour12: true,
   }).format(timestamp);
+}
+
+function formatTimeLabel(timestamp: number) {
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(timestamp);
+}
+
+function getLivePrefillConfig(windowMs: number) {
+  if (windowMs >= 3 * 60 * 60 * 1000) {
+    return {
+      interval: "5m",
+      cacheKey: "live-prefill-5m-4h",
+    };
+  }
+
+  return {
+    interval: "1m",
+    cacheKey: "live-prefill-1m-4h",
+  };
 }
 
 function getDisplayCandleTimestamp(candle: PriceCandle | null, range: ChartRangeKey) {
@@ -290,22 +449,59 @@ export function PriceChart({
   showSymbolPicker = true,
   sectionTitle = "Price History",
   bare = false,
+  hidePriceLabel = false,
+  allowTickMode = false,
 }: PriceChartProps) {
   const [range, setRange] = useState<ChartRangeKey>("24h");
+  const [chartMode, setChartMode] = useState<"line" | "ticks">("line");
+  const [liveRange, setLiveRange] = useState<(typeof LIVE_RANGE_OPTIONS)[number]["key"]>("15m");
+  const [showAllSymbols, setShowAllSymbols] = useState(false);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const [pinnedIndex, setPinnedIndex] = useState<number | null>(null);
   const [focusedCompareSymbol, setFocusedCompareSymbol] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
+  const [livePrefillTicks, setLivePrefillTicks] = useState<TickPoint[]>([]);
   const chartRef = useRef<SVGSVGElement | null>(null);
   const chartWrapRef = useRef<HTMLDivElement | null>(null);
-  const [chartWidth, setChartWidth] = useState(CHART_WIDTH);
+  const [chartWidth, setChartWidth] = useState(1);
+  const tickSeries = useMarketStore((state) => state.tickSeries);
   const primarySymbol = selectedSymbols[0] ?? null;
   const compareMode = selectedSymbols.length > 1;
   const { candlesBySymbol, loading, error } = useMultiCandleSeries(selectedSymbols, range);
   const candles = primarySymbol ? candlesBySymbol[primarySymbol] ?? [] : [];
+  const rawLiveTicks = primarySymbol ? tickSeries[primarySymbol] ?? [] : [];
   const { events } = usePriceEvents(selectedSymbols, range);
+  const liveRangeWindowMs = LIVE_RANGE_OPTIONS.find((option) => option.key === liveRange)?.windowMs
+    ?? LIVE_RANGE_OPTIONS[3].windowMs;
+  const livePrefillConfig = useMemo(
+    () => getLivePrefillConfig(liveRangeWindowMs),
+    [liveRangeWindowMs],
+  );
+  const combinedLiveTicks = useMemo(() => {
+    const baseTicks = liveRangeWindowMs <= 5 * 60 * 1000
+      ? []
+      : livePrefillTicks;
+    const lastPrefillTimestamp = baseTicks[baseTicks.length - 1]?.timestamp ?? 0;
+    const merged = [...baseTicks, ...rawLiveTicks.filter((tick) => tick.timestamp > lastPrefillTimestamp)]
+      .sort((left, right) => left.timestamp - right.timestamp);
 
-  useEffect(() => {
+    return merged.filter((tick, index) => {
+      const previous = merged[index - 1];
+      return !previous || previous.timestamp !== tick.timestamp;
+    });
+  }, [livePrefillTicks, liveRangeWindowMs, rawLiveTicks]);
+  const liveWindowEnd = combinedLiveTicks[combinedLiveTicks.length - 1]?.timestamp ?? Date.now();
+  const liveWindowStart = liveWindowEnd - liveRangeWindowMs;
+  const liveTicks = useMemo(() => {
+    if (combinedLiveTicks.length === 0) {
+      return [];
+    }
+
+    const filtered = combinedLiveTicks.filter((tick) => tick.timestamp >= liveWindowStart);
+
+    return filtered.length > 0 ? filtered : combinedLiveTicks.slice(-1);
+  }, [combinedLiveTicks, liveWindowStart]);
+
+  useLayoutEffect(() => {
     const element = chartWrapRef.current;
 
     if (!element) {
@@ -313,7 +509,7 @@ export function PriceChart({
     }
 
     const updateWidth = () => {
-      setChartWidth(Math.max(Math.round(element.clientWidth), CHART_WIDTH));
+      setChartWidth(Math.max(Math.round(element.clientWidth), 1));
     };
 
     updateWidth();
@@ -340,7 +536,54 @@ export function PriceChart({
   useEffect(() => {
     setActiveEventId(null);
     setFocusedCompareSymbol(null);
-  }, [range, primarySymbol, selectedSymbols]);
+  }, [chartMode, range, primarySymbol, selectedSymbols]);
+
+  useEffect(() => {
+    if (!allowTickMode || compareMode) {
+      setChartMode("line");
+    }
+  }, [allowTickMode, compareMode]);
+
+  useEffect(() => {
+    if (!allowTickMode || !primarySymbol || liveRangeWindowMs <= 5 * 60 * 1000) {
+      setLivePrefillTicks([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    void loadCandleSeriesByInterval(
+      primarySymbol,
+      livePrefillConfig.interval,
+      LIVE_PREFILL_LOOKBACK_MS,
+      livePrefillConfig.cacheKey,
+    )
+      .then((candles) => {
+        if (cancelled) {
+          return;
+        }
+
+        setLivePrefillTicks(
+          candles
+            .map((candle) => ({
+              timestamp: candle.endTime + 1,
+              price: candle.close,
+            }))
+            .filter((tick) => Number.isFinite(tick.price)),
+        );
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+
+        setLivePrefillTicks([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [allowTickMode, livePrefillConfig.cacheKey, livePrefillConfig.interval, liveRangeWindowMs, primarySymbol]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -373,16 +616,32 @@ export function PriceChart({
     () => buildChartGeometry(candles, chartWidth, CHART_HEIGHT),
     [candles, chartWidth],
   );
+  const tickGeometry = useMemo(
+    () => buildTickGeometry(liveTicks, chartWidth, CHART_HEIGHT, liveWindowStart, liveWindowEnd),
+    [chartWidth, liveTicks, liveWindowEnd, liveWindowStart],
+  );
   const compareGeometries = useMemo(
     () => buildCompareChartGeometries(candlesBySymbol, selectedSymbols, chartWidth, CHART_HEIGHT),
     [candlesBySymbol, chartWidth, selectedSymbols],
   );
   const eventMarkers = useMemo(() => {
+    if (chartMode === "ticks") {
+      return [] as Array<{
+        event: PriceEvent;
+        x: number;
+        y: number;
+        anchorY: number;
+        nearestIndex: number;
+        stackLevel: number;
+      }>;
+    }
+
     if (candles.length === 0 || events.length === 0 || chartGeometry.points.length === 0) {
       return [] as Array<{
         event: PriceEvent;
         x: number;
         y: number;
+        anchorY: number;
         nearestIndex: number;
         stackLevel: number;
       }>;
@@ -405,7 +664,8 @@ export function PriceChart({
         return {
           event,
           x,
-          y: Math.max(CHART_HEIGHT - 18, 18),
+          y: chartGeometry.points[nearestIndex]?.y ?? Math.max(CHART_HEIGHT - 18, 18),
+          anchorY: chartGeometry.points[nearestIndex]?.y ?? Math.max(CHART_HEIGHT - 18, 18),
           nearestIndex,
         };
       })
@@ -424,14 +684,13 @@ export function PriceChart({
       return {
         ...marker,
         stackLevel,
-        y: Math.max(marker.y - stackLevel * 12, 18),
+        y: Math.max(marker.anchorY - 10 - stackLevel * 12, 18),
       };
     });
-  }, [candles, chartGeometry.points, chartWidth, events]);
-  const activeEvent =
-    eventMarkers.find((marker) => marker.event.id === activeEventId) ?? null;
-  const isInspectingCandle = activeIndex !== null || pinnedIndex !== null;
-  const highlightedIndex = activeIndex ?? pinnedIndex ?? candles.length - 1;
+  }, [candles, chartGeometry.points, chartMode, chartWidth, events]);
+  const isInspectingCandle = activeIndex !== null;
+  const activeSeriesLength = chartMode === "ticks" ? liveTicks.length : candles.length;
+  const highlightedIndex = activeIndex ?? activeSeriesLength - 1;
   const displaySymbol = compareMode
     ? focusedCompareSymbol ?? primarySymbol
     : primarySymbol;
@@ -439,22 +698,95 @@ export function PriceChart({
   const displayAsset =
     (displaySymbol && assetMap?.[displaySymbol]) ?? (displaySymbol === primarySymbol ? currentAsset : null);
   const highlightedCandle = displayCandles[highlightedIndex] ?? null;
-  const highlightedPoint = compareMode
-    ? compareGeometries.geometries[displaySymbol ?? ""]?.points[highlightedIndex] ?? null
-    : chartGeometry.points[highlightedIndex] ?? null;
+  const highlightedTick = chartMode === "ticks" ? liveTicks[highlightedIndex] ?? null : null;
+  const highlightedPoint =
+    activeIndex === null
+      ? null
+      : compareMode
+        ? compareGeometries.geometries[displaySymbol ?? ""]?.points[highlightedIndex] ?? null
+        : chartMode === "ticks"
+          ? tickGeometry.points[highlightedIndex] ?? null
+          : chartGeometry.points[highlightedIndex] ?? null;
+  const hasActivePointer = activeIndex !== null && highlightedPoint !== null;
+  const matchedCrosshairEvent = useMemo(() => {
+    if (!isInspectingCandle) {
+      return null;
+    }
+
+    const matchingMarkers = eventMarkers.filter((marker) => marker.nearestIndex === highlightedIndex);
+
+    if (matchingMarkers.length === 0) {
+      return null;
+    }
+
+    return matchingMarkers.reduce((closest, marker) =>
+      marker.stackLevel < closest.stackLevel ? marker : closest,
+    );
+  }, [eventMarkers, highlightedIndex, isInspectingCandle]);
+  const activeEvent =
+    matchedCrosshairEvent ??
+    eventMarkers.find((marker) => marker.event.id === activeEventId) ??
+    null;
   const displayPrice =
-    isInspectingCandle && highlightedCandle
-      ? highlightedCandle.close
-      : currentPrice;
+    chartMode === "ticks"
+      ? highlightedTick?.price ?? currentAsset?.price ?? null
+      : isInspectingCandle && highlightedCandle
+        ? highlightedCandle.close
+        : currentPrice;
   const priceLabel =
     showSymbolPicker || !bare
       ? `${displaySymbol ?? primarySymbol ?? "Selection"} Price`
       : displaySymbol ?? primarySymbol ?? "Selection";
-  const displayTimestamp = getDisplayCandleTimestamp(highlightedCandle, range);
+  const displayTimestamp = chartMode === "ticks"
+    ? highlightedTick
+      ? formatTimestamp(highlightedTick.timestamp)
+      : ""
+    : getDisplayCandleTimestamp(highlightedCandle, range);
   const displayVolume =
-    isInspectingCandle && highlightedCandle
-      ? `${compactFormatter.format(highlightedCandle.volume)} vol`
-      : " ";
+    chartMode === "ticks"
+      ? " "
+      : isInspectingCandle && highlightedCandle
+        ? `${formatDisplayVolume(highlightedCandle.volume)} vol`
+        : " ";
+  const headerPercentChange = useMemo(() => {
+    if (chartMode === "ticks") {
+      if (liveTicks.length < 2) {
+        return currentAsset?.change24hPct ?? null;
+      }
+
+      const basePrice = liveTicks[0]?.price ?? null;
+      const latestPrice = liveTicks[liveTicks.length - 1]?.price ?? null;
+
+      if (basePrice === null || latestPrice === null || basePrice === 0) {
+        return currentAsset?.change24hPct ?? null;
+      }
+
+      return ((latestPrice - basePrice) / basePrice) * 100;
+    }
+
+    if (compareMode) {
+      const symbolCandles = displaySymbol ? candlesBySymbol[displaySymbol] ?? [] : [];
+      const basePrice = symbolCandles[0]?.open ?? null;
+      const latestPrice = symbolCandles[symbolCandles.length - 1]?.close ?? null;
+
+      if (basePrice === null || latestPrice === null || basePrice === 0) {
+        return currentAsset?.change24hPct ?? null;
+      }
+
+      return ((latestPrice - basePrice) / basePrice) * 100;
+    }
+
+    if (candles.length >= 2) {
+      const basePrice = candles[0]?.open ?? null;
+      const latestPrice = candles[candles.length - 1]?.close ?? null;
+
+      if (basePrice !== null && latestPrice !== null && basePrice !== 0) {
+        return ((latestPrice - basePrice) / basePrice) * 100;
+      }
+    }
+
+    return percentChange;
+  }, [candles, candlesBySymbol, chartMode, compareMode, currentAsset?.change24hPct, displaySymbol, liveTicks, percentChange]);
   const compareReadouts = useMemo(
     () =>
       selectedSymbols.map((symbol) => {
@@ -492,6 +824,7 @@ export function PriceChart({
     liquidationPrice >= chartGeometry.minClose &&
     liquidationPrice <= chartGeometry.maxClose;
   const shouldShowLiquidationGuide =
+    chartMode === "line" &&
     !compareMode &&
     liquidationPrice !== null &&
     liquidationDistancePct !== null &&
@@ -525,14 +858,25 @@ export function PriceChart({
   const updateActiveIndex = (clientX: number, clientY: number) => {
     const bounds = chartRef.current?.getBoundingClientRect();
 
-    if (!bounds || candles.length === 0) {
+    if (!bounds || activeSeriesLength === 0) {
       return null;
     }
 
     const relativeX = Math.min(Math.max(clientX - bounds.left, 0), bounds.width);
-    const normalizedX = relativeX / bounds.width;
-    const nextIndex = Math.round(normalizedX * (candles.length - 1));
-    const clampedIndex = Math.min(Math.max(nextIndex, 0), candles.length - 1);
+    const nextIndex =
+      chartMode === "ticks"
+        ? tickGeometry.points.reduce((closestIndex, point, index) => {
+            const closestPoint = tickGeometry.points[closestIndex];
+            const currentDistance = Math.abs(point.x - relativeX);
+            const closestDistance = Math.abs((closestPoint?.x ?? 0) - relativeX);
+            return currentDistance < closestDistance ? index : closestIndex;
+          }, 0)
+        : (() => {
+            const normalizedX = relativeX / bounds.width;
+            const mappedIndex = Math.round(normalizedX * (activeSeriesLength - 1));
+            return Math.min(Math.max(mappedIndex, 0), activeSeriesLength - 1);
+          })();
+    const clampedIndex = Math.min(Math.max(nextIndex, 0), activeSeriesLength - 1);
     if (compareMode) {
       const relativeY = Math.min(Math.max(clientY - bounds.top, 0), bounds.height);
       const closestSymbol = selectedSymbols.reduce<{ symbol: string | null; distance: number }>(
@@ -555,6 +899,20 @@ export function PriceChart({
     }
 
     setActiveIndex(clampedIndex);
+    const matchedEvent = chartMode === "ticks"
+      ? null
+      : eventMarkers
+        .filter((marker) => marker.nearestIndex === clampedIndex)
+        .reduce<typeof eventMarkers[number] | null>(
+          (closest, marker) =>
+            !closest || marker.stackLevel < closest.stackLevel ? marker : closest,
+          null,
+        );
+
+    if (matchedEvent) {
+      setActiveEventId(matchedEvent.event.id);
+    }
+
     return clampedIndex;
   };
 
@@ -564,15 +922,19 @@ export function PriceChart({
   const tooltipY = highlightedPoint
     ? Math.max(highlightedPoint.y - 34, 8)
     : 8;
+  const hiddenSymbolCount = Math.max(availableSymbols.length - MAX_VISIBLE_SYMBOL_CHIPS, 0);
+  const visibleSymbols = showAllSymbols
+    ? availableSymbols
+    : availableSymbols.slice(0, MAX_VISIBLE_SYMBOL_CHIPS);
 
   return (
     <section className="mb-8">
       {sectionTitle ? <SectionHeading title={sectionTitle} /> : null}
       <div className={bare ? "px-0 py-0" : "panel rounded-[28px] p-5"}>
-              {showSymbolPicker ? (
+        {showSymbolPicker ? (
           <div className="mb-5 flex flex-wrap gap-2">
-              {availableSymbols.map((symbol) => {
-                const activeIndex = selectedSymbols.indexOf(symbol);
+            {visibleSymbols.map((symbol) => {
+              const activeIndex = selectedSymbols.indexOf(symbol);
               const active = activeIndex !== -1;
               const disabled = !active && selectedSymbols.length >= MAX_SELECTED_SYMBOLS;
 
@@ -621,25 +983,36 @@ export function PriceChart({
                 </button>
               );
             })}
+            {hiddenSymbolCount > 0 ? (
+              <button
+                type="button"
+                onClick={() => setShowAllSymbols((current) => !current)}
+                className="rounded-full bg-white/4 px-3 py-2 text-xs font-medium uppercase tracking-[0.16em] text-zinc-400 transition hover:bg-white/7"
+              >
+                {showAllSymbols ? "Show Less" : `View ${hiddenSymbolCount} More`}
+              </button>
+            ) : null}
           </div>
         ) : null}
 
         <div className="mb-3 flex items-end justify-between gap-4">
           <div>
-            <div className="mb-1 text-xs font-medium uppercase tracking-[0.18em] text-zinc-500">
-              {priceLabel}
-            </div>
+            {!hidePriceLabel ? (
+              <div className="mb-1 text-xs font-medium uppercase tracking-[0.18em] text-zinc-500">
+                {priceLabel}
+              </div>
+            ) : null}
             <div className="display-serif text-[2.6rem] leading-none tracking-[-0.04em] text-zinc-100">
-              {displayPrice !== null ? currencyFormatter.format(displayPrice) : "—"}
+              {displayPrice !== null ? formatDisplayPrice(displayPrice) : "—"}
             </div>
           </div>
           {compareMode ? null : (
             <div
               className={`rounded-full px-3 py-2 text-sm font-medium ${
-                (percentChange ?? 0) >= 0 ? "bg-emerald-500/12 text-emerald-200" : "bg-rose-500/12 text-rose-200"
+                (headerPercentChange ?? 0) >= 0 ? "bg-emerald-500/12 text-emerald-200" : "bg-rose-500/12 text-rose-200"
               }`}
             >
-              {percentChange !== null ? formatSignedPercent(percentChange) : "—"}
+              {headerPercentChange !== null ? formatSignedPercent(headerPercentChange) : "—"}
             </div>
           )}
         </div>
@@ -664,7 +1037,7 @@ export function PriceChart({
                     {readout.symbol}
                   </span>
                   <span className="text-sm font-medium text-zinc-100">
-                    {readout.price !== null ? currencyFormatter.format(readout.price) : "—"}
+                    {readout.price !== null ? formatDisplayPrice(readout.price) : "—"}
                   </span>
                   <span
                     className={`text-xs font-semibold ${
@@ -679,32 +1052,43 @@ export function PriceChart({
           </div>
         ) : null}
 
-        <div className="mb-5 flex gap-2">
-          {RANGE_OPTIONS.map((option) => {
-            const active = option.key === range;
-
-            return (
-              <button
-                key={option.key}
-                type="button"
-                onClick={() => setRange(option.key)}
-                className={`rounded-full px-3 py-2 text-xs font-medium uppercase tracking-[0.16em] transition ${
-                  active
-                    ? "bg-white/10 text-zinc-100"
-                    : "bg-transparent text-zinc-500 hover:bg-white/6"
-                }`}
-              >
-                {option.label}
-              </button>
-            );
-          })}
-        </div>
-
         <div
           ref={chartWrapRef}
-          className="relative rounded-[24px] border border-white/6 bg-white/[0.03] p-4"
+          className="relative rounded-[24px] border border-white/6 bg-white/[0.03] px-2 pb-4 pt-4"
         >
-          {loading && candles.length === 0 ? (
+          {allowTickMode && !compareMode ? (
+            <div className="mb-4 flex flex-wrap items-center gap-3">
+              <div className="flex flex-wrap gap-2">
+                {(["line", "ticks"] as const).map((mode) => {
+                  const active = chartMode === mode;
+
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setChartMode(mode)}
+                        className={`px-2 py-1 text-[0.625rem] font-medium uppercase tracking-[0.14em] transition ${
+                          active
+                            ? "text-zinc-100"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        }`}
+                      >
+                        {mode === "line" ? "Price" : "Live Chart"}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          {chartMode === "ticks" && liveTicks.length === 0 ? (
+            <div
+              className="rounded-[18px] bg-white/4 px-4 py-4 text-sm text-zinc-400"
+              style={{ height: `${CHART_HEIGHT}px` }}
+            >
+              Waiting for live ticks.
+            </div>
+          ) : loading && candles.length === 0 ? (
             <div
               className="animate-pulse rounded-[18px] bg-white/6"
               style={{ height: `${CHART_HEIGHT}px` }}
@@ -713,7 +1097,7 @@ export function PriceChart({
             <div className="rounded-[18px] border border-rose-500/20 bg-rose-500/10 px-4 py-4 text-sm text-rose-200">
               {error}
             </div>
-          ) : candles.length === 0 ? (
+          ) : chartMode === "line" && candles.length === 0 ? (
             <div
               className="rounded-[18px] bg-white/4 px-4 py-4 text-sm text-zinc-400"
               style={{ height: `${CHART_HEIGHT}px` }}
@@ -732,19 +1116,24 @@ export function PriceChart({
                 className="w-full overflow-visible touch-none"
                 style={{ height: `${CHART_HEIGHT}px` }}
                 onPointerDown={(event) => {
-                  const nextIndex = updateActiveIndex(event.clientX, event.clientY);
-                  setPinnedIndex(nextIndex);
+                  updateActiveIndex(event.clientX, event.clientY);
                 }}
                 onPointerMove={(event) => {
                   if (event.pointerType === "mouse" || event.pressure > 0) {
                     updateActiveIndex(event.clientX, event.clientY);
                   }
                 }}
+                onPointerUp={() => {
+                  setActiveIndex(null);
+                  setFocusedCompareSymbol(null);
+                }}
+                onPointerCancel={() => {
+                  setActiveIndex(null);
+                  setFocusedCompareSymbol(null);
+                }}
                 onPointerLeave={() => {
                   setActiveIndex(null);
-                  if (pinnedIndex === null) {
-                    setFocusedCompareSymbol(null);
-                  }
+                  setFocusedCompareSymbol(null);
                 }}
               >
                 <defs>
@@ -753,7 +1142,7 @@ export function PriceChart({
                     <stop offset="100%" stopColor="rgba(212,168,79,0)" />
                   </linearGradient>
                 </defs>
-                {!compareMode ? <path d={chartGeometry.areaPath} fill="url(#price-chart-fill)" /> : null}
+                {!compareMode && chartMode === "line" ? <path d={chartGeometry.areaPath} fill="url(#price-chart-fill)" /> : null}
                 {compareMode
                   ? selectedSymbols.map((symbol, index) => {
                       const geometry = compareGeometries.geometries[symbol];
@@ -777,7 +1166,7 @@ export function PriceChart({
                     })
                   : (
                     <path
-                      d={chartGeometry.linePath}
+                      d={chartMode === "ticks" ? tickGeometry.linePath : chartGeometry.linePath}
                       fill="none"
                       stroke="var(--gold)"
                       strokeWidth="3"
@@ -871,28 +1260,6 @@ export function PriceChart({
                           strokeWidth="2"
                         />
                         )}
-                    <g transform={`translate(${tooltipX}, ${tooltipY})`}>
-                      <rect
-                        x="0"
-                        y="0"
-                        width="84"
-                        height="24"
-                        rx="12"
-                        fill="rgba(15,15,15,0.92)"
-                        stroke="rgba(255,255,255,0.08)"
-                      />
-                      <text
-                        x="42"
-                        y="16"
-                        textAnchor="middle"
-                        fill="var(--gold)"
-                        fontSize="10"
-                        fontWeight="600"
-                        letterSpacing="0.04em"
-                      >
-                        {currencyFormatter.format(highlightedCandle?.close ?? 0)}
-                      </text>
-                    </g>
                   </>
                 ) : null}
                 {eventMarkers.map((marker) => {
@@ -904,7 +1271,7 @@ export function PriceChart({
                         x1={marker.x}
                         x2={marker.x}
                         y1={marker.y + 6}
-                        y2={CHART_HEIGHT - CHART_PADDING_Y}
+                        y2={marker.anchorY}
                         stroke={isActive ? "rgba(212,168,79,0.35)" : "rgba(255,255,255,0.12)"}
                         strokeWidth="1"
                         strokeDasharray="3 4"
@@ -921,13 +1288,9 @@ export function PriceChart({
                           setActiveEventId((current) =>
                             current === marker.event.id ? null : marker.event.id,
                           );
-                          setPinnedIndex(marker.nearestIndex);
-                          setFocusedCompareSymbol(primarySymbol);
                         }}
                         onPointerEnter={() => {
                           setActiveEventId(marker.event.id);
-                          setPinnedIndex(marker.nearestIndex);
-                          setFocusedCompareSymbol(primarySymbol);
                         }}
                         style={{ cursor: "pointer" }}
                       />
@@ -948,6 +1311,34 @@ export function PriceChart({
                     </g>
                   );
                 })}
+                {hasActivePointer ? (
+                  <g transform={`translate(${tooltipX}, ${tooltipY})`}>
+                    <rect
+                      x="0"
+                      y="0"
+                      width="84"
+                      height="24"
+                      rx="12"
+                      fill="rgba(15,15,15,0.92)"
+                      stroke="rgba(255,255,255,0.08)"
+                    />
+                    <text
+                      x="42"
+                      y="16"
+                      textAnchor="middle"
+                      fill="var(--gold)"
+                      fontSize="10"
+                      fontWeight="600"
+                      letterSpacing="0.04em"
+                    >
+                      {formatDisplayPrice(
+                        chartMode === "ticks"
+                          ? highlightedTick?.price ?? currentAsset?.price ?? 0
+                          : highlightedCandle?.close ?? 0,
+                      )}
+                    </text>
+                  </g>
+                ) : null}
                 <rect
                   x={0}
                   y={0}
@@ -962,37 +1353,83 @@ export function PriceChart({
                 className="mt-3 h-[18px] w-full overflow-visible"
               >
                 <text
-                  x={
-                    (compareMode
+                  x={chartMode === "ticks" ? 2 : (
+                    compareMode
                       ? compareGeometries.geometries[primarySymbol ?? ""]?.points[0]?.x
-                      : chartGeometry.points[0]?.x) ?? CHART_PADDING_X
-                  }
+                      : chartGeometry.points[0]?.x
+                  ) ?? CHART_PADDING_X}
                   y="13"
-                  textAnchor="middle"
+                  textAnchor={chartMode === "ticks" ? "start" : "middle"}
                   fill="rgb(113 113 122)"
                   fontSize="10"
                   letterSpacing="0.08em"
                 >
-                  {formatTime(candles[0].startTime)}
+                  {chartMode === "ticks"
+                    ? formatTimeLabel(liveWindowStart)
+                    : formatTime(candles[0].startTime)}
                 </text>
                 <text
-                  x={
-                    (compareMode
+                  x={chartMode === "ticks" ? chartWidth - 2 : (
+                    compareMode
                       ? compareGeometries.geometries[primarySymbol ?? ""]?.points[
                           (compareGeometries.geometries[primarySymbol ?? ""]?.points.length ?? 1) - 1
                         ]?.x
-                      : chartGeometry.points[chartGeometry.points.length - 1]?.x) ??
-                    chartWidth - CHART_PADDING_X
-                  }
+                      : chartGeometry.points[chartGeometry.points.length - 1]?.x
+                  ) ?? chartWidth - CHART_PADDING_X}
                   y="13"
-                  textAnchor="middle"
+                  textAnchor={chartMode === "ticks" ? "end" : "middle"}
                   fill="rgb(113 113 122)"
                   fontSize="10"
                   letterSpacing="0.08em"
                 >
-                  {formatTime(candles[candles.length - 1].endTime)}
+                  {chartMode === "ticks"
+                    ? formatTimeLabel(liveWindowEnd)
+                    : formatTime(candles[candles.length - 1].endTime)}
                 </text>
               </svg>
+              {chartMode === "ticks" ? (
+                <div className="mt-3 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+                  {LIVE_RANGE_OPTIONS.map((option) => {
+                    const active = option.key === liveRange;
+
+                    return (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setLiveRange(option.key)}
+                        className={`px-0 py-0 text-[0.7rem] font-medium uppercase tracking-[0.12em] transition ${
+                          active
+                            ? "text-zinc-100"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="mt-3 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+                  {RANGE_OPTIONS.map((option) => {
+                    const active = option.key === range;
+
+                    return (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setRange(option.key)}
+                        className={`px-0 py-0 text-[0.7rem] font-medium uppercase tracking-[0.12em] transition ${
+                          active
+                            ? "text-zinc-100"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               {activeEvent ? (
                 <div className="mt-3 rounded-[18px] border border-white/6 bg-black/20 px-4 py-3">
                   <div className="text-sm font-medium text-zinc-100">
@@ -1025,7 +1462,11 @@ export function PriceChart({
         <div className="mt-4 grid grid-cols-2 gap-3 text-sm text-zinc-400">
           <div className="rounded-[18px] bg-white/[0.03] px-4 py-3">
             <div className="mb-1 text-xs uppercase tracking-[0.16em] text-zinc-500">24h Change</div>
-            <div className="font-medium text-zinc-100">
+            <div
+              className={`font-medium ${
+                (displayAsset?.change24hPct ?? 0) >= 0 ? "text-emerald-200" : "text-[var(--negative)]"
+              }`}
+            >
               {displayAsset ? formatSignedPercent(displayAsset.change24hPct) : "—"}
             </div>
           </div>
@@ -1037,7 +1478,7 @@ export function PriceChart({
               {shouldShowLiquidationGuide
                 ? `${liquidationDistancePct?.toFixed(2) ?? "—"}%`
                 : candles.length
-                  ? compactFormatter.format(totalVolume)
+                  ? formatDisplayVolume(totalVolume)
                   : "—"}
             </div>
           </div>

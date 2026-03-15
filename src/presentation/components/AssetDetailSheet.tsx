@@ -9,6 +9,8 @@ import {
   getLiquidationRisk,
 } from "../../domain/utils/liquidation";
 import { useHourlyVolatility } from "../hooks/useHourlyVolatility";
+import { useTradeStore } from "../stores/tradeStore";
+import { CopyTradeSheet } from "./CopyTradeSheet";
 import { PriceChart } from "./PriceChart";
 
 const currencyFormatter = new Intl.NumberFormat("en-US", {
@@ -39,6 +41,10 @@ function formatSignedPercent(value: number, fractionDigits = 2) {
   return `${normalized >= 0 ? "+" : ""}${normalized.toFixed(fractionDigits)}%`;
 }
 
+function formatFundingRatePercent(value: number) {
+  return formatSignedPercent(value * 100, 4);
+}
+
 function MetricCard({
   label,
   value,
@@ -63,34 +69,26 @@ function MetricStripItem({
   value,
   toneClass = "text-zinc-200",
   hint,
-  tooltipId,
-  activeTooltipId,
-  onTooltipToggle,
 }: {
   label: string;
   value: string;
   toneClass?: string;
   hint?: string;
-  tooltipId?: string;
-  activeTooltipId?: string | null;
-  onTooltipToggle?: (id: string) => void;
 }) {
   return (
     <div className="flex h-full min-h-[4.5rem] flex-col justify-start rounded-[16px] border border-white/7 bg-white/[0.025] px-2 py-2 text-center">
-      <div className="grid min-h-[1.45rem] grid-cols-[1fr_auto] items-center gap-1">
-        <span className="pl-5 text-center text-[0.54rem] font-medium uppercase tracking-[0.1em] text-zinc-500">
-          {label}
+      <div className="relative min-h-[1.45rem]">
+        <span
+          className="group relative inline-flex max-w-full items-center justify-center text-center text-[0.54rem] font-medium uppercase tracking-[0.1em] text-zinc-500"
+          tabIndex={hint ? 0 : -1}
+        >
+          <span className="truncate">{label}</span>
+          {hint ? (
+            <span className="pointer-events-none absolute bottom-[calc(100%+0.5rem)] left-1/2 z-20 hidden w-44 -translate-x-1/2 rounded-[14px] border border-white/8 bg-[#111111] px-3 py-2 text-left text-[0.68rem] normal-case tracking-normal text-zinc-200 shadow-[0_18px_40px_rgba(0,0,0,0.45)] group-hover:block group-focus-visible:block">
+              {hint}
+            </span>
+          ) : null}
         </span>
-        {hint && tooltipId && onTooltipToggle ? (
-          <TooltipHint
-            id={tooltipId}
-            text={hint}
-            activeTooltipId={activeTooltipId}
-            onToggle={onTooltipToggle}
-          />
-        ) : (
-          <span className="h-4 w-4" aria-hidden="true" />
-        )}
       </div>
       <div className={`mt-1 text-[0.8rem] font-medium ${toneClass}`}>{value}</div>
     </div>
@@ -144,17 +142,29 @@ interface AssetDetailSheetProps {
   symbol: string;
   asset: AssetRow | null;
   position: Position | null;
+  sourceAddress: string | null;
   onClose: () => void;
+  modal?: boolean;
 }
 
 export function AssetDetailSheet({
   symbol,
   asset,
   position,
+  sourceAddress,
   onClose,
+  modal = true,
 }: AssetDetailSheetProps) {
   const [activeTooltipId, setActiveTooltipId] = useState<string | null>(null);
+  const [tradeSheetOpen, setTradeSheetOpen] = useState(false);
   const fundingRate = asset?.fundingRate ?? null;
+  const tradeWalletAddress = useTradeStore((state) => state.walletAddress);
+  const tradeApprovalStatus = useTradeStore((state) => state.approvalStatus);
+  const tradeBusy = useTradeStore((state) => state.busy);
+  const tradeError = useTradeStore((state) => state.error);
+  const tradeLastStatus = useTradeStore((state) => state.lastStatus);
+  const connectWallet = useTradeStore((state) => state.connectWallet);
+  const enableOneTapTrading = useTradeStore((state) => state.enableOneTapTrading);
   const volatilityBySymbol = useHourlyVolatility(position ? [position] : []);
   const liquidationDistancePct = position ? getLiquidationDistancePct(position) : null;
   const liquidationRisk = position ? getLiquidationRisk(liquidationDistancePct) : null;
@@ -196,69 +206,85 @@ export function AssetDetailSheet({
     setActiveTooltipId((current) => (current === id || id === "" ? null : id));
   };
 
-  return (
+  const sourceAddressLabel = sourceAddress
+    ? `${sourceAddress.slice(0, 6)}...${sourceAddress.slice(-4)}`
+    : "No source wallet loaded";
+  const tradeStatusLabel = tradeWalletAddress
+    ? `${tradeWalletAddress.slice(0, 6)}...${tradeWalletAddress.slice(-4)}`
+    : "No wallet connected";
+
+  const showPositionDetails = modal && Boolean(position);
+  const chartPosition = modal ? position : null;
+
+  const contentInner = (
     <div
-      className="fixed inset-0 z-30 overflow-y-auto bg-black/72 backdrop-blur-sm"
-      onClick={onClose}
+      className={modal ? "panel rounded-[32px] p-5" : ""}
+      onClick={(event) => {
+        if (modal) {
+          event.stopPropagation();
+        }
+      }}
     >
-      <div className="mx-auto min-h-screen max-w-[32rem] px-4 py-6">
-        <div
-          className="panel min-h-[calc(100vh-3rem)] rounded-[32px] p-5"
-          onClick={(event) => event.stopPropagation()}
-        >
+          {!modal ? (
+            <div className="mb-4">
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Back to markets"
+                className="inline-flex items-center gap-2 text-[0.72rem] font-medium uppercase tracking-[0.16em] text-zinc-500 transition hover:text-zinc-100"
+              >
+                <span aria-hidden className="text-[1rem] leading-none">←</span>
+                <span>Back</span>
+              </button>
+            </div>
+          ) : null}
           <div className="mb-5 flex items-start justify-between gap-4">
             <div>
-              <div className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-zinc-500">
-                {position ? "Position Detail" : "Market Detail"}
-              </div>
-              <div className="mt-2 flex items-center gap-2">
-                <h2 className="text-2xl font-semibold text-zinc-100">{symbol}</h2>
-                {position ? (
+              <div className="flex items-center gap-2">
+                <h2 className="text-[2.1rem] font-semibold leading-none text-zinc-100">{symbol}</h2>
+                {showPositionDetails ? (
                   <span
                     className={`rounded-full px-2 py-1 text-[0.65rem] font-medium uppercase tracking-[0.14em] ${
-                      position.size >= 0
+                      position!.size >= 0
                         ? "bg-emerald-500/12 text-emerald-200"
                         : "bg-amber-500/12 text-amber-200"
                     }`}
                   >
-                    {position.size >= 0 ? "Long" : "Short"}
+                    {position!.size >= 0 ? "Long" : "Short"}
                   </span>
                 ) : null}
               </div>
-              {!position ? (
-                <div className="mt-2 text-sm text-zinc-400">
-                  {asset?.onlyIsolated ? "Isolated only market" : "Perp market on Hyperliquid"}
-                </div>
-              ) : null}
             </div>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close detail"
-              className="rounded-full border border-white/8 px-3 py-2 text-zinc-300 transition hover:bg-white/[0.04]"
-            >
-              <span aria-hidden="true" className="block text-sm leading-none">
-                ×
-              </span>
-            </button>
+            {modal ? (
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close detail"
+                className="mt-[-0.1rem] inline-flex min-h-10 min-w-10 shrink-0 items-start justify-center p-1 text-zinc-400 transition hover:text-zinc-100"
+              >
+                <span aria-hidden="true" className="block text-[1.45rem] leading-none">
+                  ×
+                </span>
+              </button>
+            ) : null}
           </div>
 
-          {position ? (
+          {showPositionDetails ? (
             <div className="mb-6">
               <div className="mb-2 text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-zinc-500">
                 Unrealized PnL
               </div>
               <div
                 className={`display-serif text-[3rem] leading-none tracking-[-0.05em] ${
-                  position.unrealizedPnl >= 0 ? "text-[var(--gold)]" : "text-[var(--negative)]"
+                  position!.unrealizedPnl >= 0 ? "text-[var(--gold)]" : "text-[var(--negative)]"
                 }`}
               >
-                {roundedCurrencyFormatter.format(position.unrealizedPnl)}
+                {roundedCurrencyFormatter.format(position!.unrealizedPnl)}
               </div>
             </div>
           ) : null}
 
-          {position ? (
+          {showPositionDetails ? (
             <div className="mb-6">
               <div className="mb-4 text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-zinc-500">
                 Position
@@ -266,79 +292,69 @@ export function AssetDetailSheet({
               <div className="grid grid-cols-2 gap-3">
                 <MetricCard
                   label="Size"
-                  value={`${sizeFormatter.format(position.size)} ${position.coin}`}
+                  value={`${sizeFormatter.format(position!.size)} ${position!.coin}`}
                 />
                 <MetricCard
                   label="Margin Used"
-                  value={compactUsdFormatter.format(position.marginUsed)}
+                  value={compactUsdFormatter.format(position!.marginUsed)}
                 />
                 <MetricCard
                   label="Entry"
-                  value={currencyFormatter.format(position.entryPrice)}
+                  value={currencyFormatter.format(position!.entryPrice)}
                 />
                 <MetricCard
                   label="Mark"
-                  value={currencyFormatter.format(position.markPrice)}
+                  value={currencyFormatter.format(position!.markPrice)}
                 />
               </div>
             </div>
           ) : null}
 
-          {position ? (
+          {showPositionDetails && liquidationRisk && endpointValues ? (
             <div className="mb-6">
-              {liquidationRisk && endpointValues ? (
-                <>
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <span className="text-[0.68rem] uppercase tracking-[0.18em] text-zinc-500">
-                      Liquidation Proximity
-                    </span>
-                    <span
-                      className={`text-[0.72rem] font-medium uppercase tracking-[0.14em] ${liquidationRisk.toneClass}`}
-                    >
-                      {liquidationRisk.label}
-                    </span>
-                  </div>
-                  <div className="text-sm text-zinc-400">
-                    {liquidationDistancePct !== null
-                      ? `${liquidationDistancePct.toFixed(2)}% away`
-                      : "Liquidation price unavailable"}
-                    {liquidationCushion !== null
-                      ? ` · ${roundedCurrencyFormatter.format(liquidationCushion)} cushion`
-                      : ""}
-                  </div>
-                  <div className="mt-1 flex items-center gap-1.5 text-sm text-zinc-500">
-                    <span>Est. time to liq {formatEstimatedTime(estimatedHoursToLiq)}</span>
-                    <TooltipHint
-                      id="eta-to-liq"
-                      text="Estimated from current distance to liquidation versus recent 1 hr realized volatility."
-                      activeTooltipId={activeTooltipId}
-                      onToggle={handleTooltipToggle}
-                    />
-                  </div>
-                  <div className="mt-4 relative h-2 rounded-full bg-white/8">
-                    <div
-                      className="absolute inset-0 rounded-full opacity-85 transition-all duration-500"
-                      style={{ background: endpointValues.gradient }}
-                    />
-                    <div
-                      className="absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full border-2 border-black bg-zinc-100 shadow-[0_0_0_2px_rgba(5,5,5,0.22)] transition-all duration-500"
-                      style={{ left: `calc(${gaugeMarkerPct}% - 6px)` }}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-4 text-sm text-zinc-200">
-                    <span>{endpointValues.leftPrice}</span>
-                    <span>{endpointValues.rightPrice}</span>
-                  </div>
-                  <div className="mt-1 flex items-center justify-between gap-4 text-[0.68rem] uppercase tracking-[0.16em] text-zinc-500">
-                    <span>{endpointValues.leftLabel}</span>
-                    <span>{endpointValues.rightLabel}</span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-sm text-zinc-500">
-                  Liquidation price unavailable for this position.
-                </div>
-              )}
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <span className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-zinc-500">
+                  Liquidation Proximity
+                </span>
+                <span
+                  className={`text-[0.72rem] font-medium uppercase tracking-[0.14em] ${liquidationRisk.toneClass}`}
+                >
+                  {liquidationRisk.label}
+                </span>
+              </div>
+              <div className="text-sm text-zinc-400">
+                {liquidationDistancePct !== null ? `${liquidationDistancePct.toFixed(2)}% away` : ""}
+                {liquidationCushion !== null
+                  ? ` · ${roundedCurrencyFormatter.format(liquidationCushion)} cushion`
+                  : ""}
+              </div>
+              <div className="mt-1 flex items-center gap-1.5 text-sm text-zinc-500">
+                <span>Est. time to liq {formatEstimatedTime(estimatedHoursToLiq)}</span>
+                <TooltipHint
+                  id="eta-to-liq"
+                  text="Estimated from current distance to liquidation versus recent 1 hr realized volatility."
+                  activeTooltipId={activeTooltipId}
+                  onToggle={handleTooltipToggle}
+                />
+              </div>
+              <div className="mt-4 relative h-2 rounded-full bg-white/8">
+                <div
+                  className="absolute inset-0 rounded-full opacity-85 transition-all duration-500"
+                  style={{ background: endpointValues.gradient }}
+                />
+                <div
+                  className="absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full border-2 border-black bg-zinc-100 shadow-[0_0_0_2px_rgba(5,5,5,0.22)] transition-all duration-500"
+                  style={{ left: `calc(${gaugeMarkerPct}% - 6px)` }}
+                />
+              </div>
+              <div className="mt-3 flex items-center justify-between gap-4 text-sm text-zinc-200">
+                <span>{endpointValues.leftPrice}</span>
+                <span>{endpointValues.rightPrice}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-4 text-[0.68rem] uppercase tracking-[0.16em] text-zinc-500">
+                <span>{endpointValues.leftLabel}</span>
+                <span>{endpointValues.rightLabel}</span>
+              </div>
             </div>
           ) : null}
 
@@ -348,25 +364,90 @@ export function AssetDetailSheet({
             onSelectedSymbolsChange={() => {}}
             currentAsset={asset}
             assetMap={asset ? { [symbol]: asset } : undefined}
-            currentPosition={position}
+            currentPosition={chartPosition}
             showSymbolPicker={false}
             sectionTitle=""
             bare
+            hidePriceLabel
+            allowTickMode={!modal}
           />
 
-          {(asset || position) ? (
+          {showPositionDetails && asset ? (
+            <div className="mt-6">
+              <div>
+                <div>
+                  <div className="text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+                    Copy Trade
+                  </div>
+                  <div className="mt-2 text-xs text-zinc-500">
+                    Mirror this position from the inspected wallet into your own connected Hyperliquid account.
+                  </div>
+                  <div className="mt-4 rounded-[18px] border border-white/6 bg-white/[0.02] px-4 py-3">
+                    <div className="flex items-center justify-between gap-3 text-sm">
+                      <span className="text-zinc-500">Inspecting wallet</span>
+                      <span className="font-medium text-zinc-200">{sourceAddressLabel}</span>
+                    </div>
+                    <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/6 pt-3 text-sm">
+                      <span className="text-zinc-500">Your trading wallet</span>
+                      <span className="font-medium text-zinc-200">{tradeStatusLabel}</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4">
+                  {tradeApprovalStatus === "approved" ? (
+                    <button
+                      type="button"
+                      onClick={() => setTradeSheetOpen(true)}
+                      className="w-full rounded-[18px] bg-[var(--gold)] px-4 py-3 text-sm font-semibold text-black transition hover:brightness-105"
+                    >
+                      Copy Position
+                    </button>
+                  ) : tradeWalletAddress ? (
+                    <button
+                      type="button"
+                      disabled={tradeBusy}
+                      onClick={() => {
+                        void enableOneTapTrading();
+                      }}
+                      className="w-full rounded-[18px] border border-white/10 px-4 py-3 text-sm font-medium text-zinc-100 transition hover:bg-white/[0.04] disabled:opacity-60"
+                    >
+                      {tradeBusy && tradeApprovalStatus === "checking"
+                        ? "Preparing..."
+                        : "Enable Copy Trading"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={tradeBusy}
+                      onClick={() => {
+                        void connectWallet();
+                      }}
+                      className="w-full rounded-[18px] border border-white/10 px-4 py-3 text-sm font-medium text-zinc-100 transition hover:bg-white/[0.04] disabled:opacity-60"
+                    >
+                      {tradeBusy ? "Connecting..." : "Connect Wallet"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {tradeError ? (
+                <div className="mt-3 text-sm text-rose-300">{tradeError}</div>
+              ) : null}
+              {tradeLastStatus && !tradeSheetOpen ? (
+                <div className="mt-3 text-sm text-emerald-300">{tradeLastStatus}</div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {asset ? (
             <div className="mt-6 border-t border-white/6 pt-5">
               <div className="mb-3 text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-zinc-500">
-                Market Context
+                Market Stats
               </div>
               <div className="grid grid-cols-4 gap-2">
                 <MetricStripItem
                   label="Volume"
                   value={asset?.volume24h != null ? compactUsdFormatter.format(asset.volume24h) : "—"}
                   hint="Total traded notional over the last 24 hours."
-                  tooltipId="market-context-volume"
-                  activeTooltipId={activeTooltipId}
-                  onTooltipToggle={handleTooltipToggle}
                 />
                 <MetricStripItem
                   label="Open Interest"
@@ -374,13 +455,10 @@ export function AssetDetailSheet({
                     asset?.openInterest != null ? compactUsdFormatter.format(asset.openInterest) : "—"
                   }
                   hint="Total notional value of open contracts currently outstanding."
-                  tooltipId="market-context-open-interest"
-                  activeTooltipId={activeTooltipId}
-                  onTooltipToggle={handleTooltipToggle}
                 />
                 <MetricStripItem
                   label="Funding"
-                  value={fundingRate !== null ? formatSignedPercent(fundingRate, 4) : "—"}
+                  value={fundingRate !== null ? formatFundingRatePercent(fundingRate) : "—"}
                   toneClass={
                     fundingRate === null
                       ? "text-zinc-200"
@@ -389,23 +467,50 @@ export function AssetDetailSheet({
                         : "text-[var(--negative)]"
                   }
                   hint="Periodic payment rate between longs and shorts that keeps the perp anchored to spot."
-                  tooltipId="market-context-funding"
-                  activeTooltipId={activeTooltipId}
-                  onTooltipToggle={handleTooltipToggle}
                 />
                 <MetricStripItem
                   label="Max Leverage"
                   value={asset ? `${asset.maxLeverage}x` : position ? `${position.maxLeverage}x` : "—"}
                   hint="Highest leverage the market currently allows under Hyperliquid margin rules."
-                  tooltipId="market-context-max-leverage"
-                  activeTooltipId={activeTooltipId}
-                  onTooltipToggle={handleTooltipToggle}
                 />
               </div>
             </div>
           ) : null}
-        </div>
+    </div>
+  );
+
+  if (!modal) {
+    return (
+      <>
+        <section className="mb-8">
+          {contentInner}
+        </section>
+        {tradeSheetOpen && position && asset ? (
+          <CopyTradeSheet
+            asset={asset}
+            position={position}
+            onClose={() => setTradeSheetOpen(false)}
+          />
+        ) : null}
+      </>
+    );
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-30 overflow-y-auto bg-black/72 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div className="mx-auto max-w-[32rem] px-4 py-6">
+        {contentInner}
       </div>
+      {tradeSheetOpen && position && asset ? (
+        <CopyTradeSheet
+          asset={asset}
+          position={position}
+          onClose={() => setTradeSheetOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
